@@ -1,7 +1,8 @@
 #[cfg(test)]
 use crate::contact_info::{sanitize_socket, ContactInfo, Error, Protocol, SOCKET_ADDR_UNSPECIFIED};
 use {
-    crate::crds_data::MAX_WALLCLOCK,
+    crate::crds_data::{reject_deserialize, MAX_WALLCLOCK},
+    serde::Serialize,
     solana_pubkey::Pubkey,
     solana_sanitize::{Sanitize, SanitizeError},
     solana_streamer::socket::SocketAddrSpace,
@@ -10,7 +11,7 @@ use {
 
 /// Structure representing a node on the network
 #[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct LegacyContactInfo {
     id: Pubkey,
     /// gossip address
@@ -38,6 +39,7 @@ pub(crate) struct LegacyContactInfo {
     /// node shred version
     shred_version: u16,
 }
+reject_deserialize!(LegacyContactInfo, "LegacyContactInfo is deprecated");
 
 impl Sanitize for LegacyContactInfo {
     fn sanitize(&self) -> std::result::Result<(), SanitizeError> {

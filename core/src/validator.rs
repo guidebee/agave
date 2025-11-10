@@ -4,7 +4,9 @@ pub use solana_perf::report_target_features;
 use {
     crate::{
         admin_rpc_post_init::{AdminRpcRequestMetadataPostInit, KeyUpdaterType, KeyUpdaters},
-        banking_stage::BankingStage,
+        banking_stage::{
+            transaction_scheduler::scheduler_controller::SchedulerConfig, BankingStage,
+        },
         banking_trace::{self, BankingTracer, TraceError},
         cluster_info_vote_listener::VoteTracker,
         completed_data_sets_service::CompletedDataSetsService,
@@ -19,6 +21,9 @@ use {
             repair_handler::RepairHandlerType,
             serve_repair_service::ServeRepairService,
         },
+        resource_limits::{
+            adjust_nofile_limit, validate_memlock_limit_for_disk_io, ResourceLimitError,
+        },
         sample_performance_service::SamplePerformanceService,
         sigverify,
         snapshot_packager_service::SnapshotPackagerService,
@@ -26,26 +31,35 @@ use {
         system_monitor_service::{
             verify_net_stats_access, SystemMonitorService, SystemMonitorStatsReportConfig,
         },
-        tpu::{ForwardingClientOption, Tpu, TpuSockets, DEFAULT_TPU_COALESCE},
+        tpu::{ForwardingClientOption, Tpu, TpuSockets},
         tvu::{Tvu, TvuConfig, TvuSockets},
+    },
+    agave_snapshots::{
+        snapshot_archive_info::SnapshotArchiveInfoGetter as _, snapshot_config::SnapshotConfig,
+        snapshot_hash::StartingSnapshotHashes, SnapshotInterval,
     },
     anyhow::{anyhow, Context, Result},
     crossbeam_channel::{bounded, unbounded, Receiver},
     quinn::Endpoint,
+    serde::{Deserialize, Serialize},
+    solana_account::ReadableAccount,
     solana_accounts_db::{
         accounts_db::{AccountsDbConfig, ACCOUNTS_DB_CONFIG_FOR_TESTING},
         accounts_update_notifier_interface::AccountsUpdateNotifier,
-        hardened_unpack::{
-            open_genesis_config, OpenGenesisConfigError, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
-        },
         utils::move_and_async_delete_path_contents,
     },
-    solana_client::connection_cache::{ConnectionCache, Protocol},
+    solana_client::{
+        client_option::ClientOption,
+        connection_cache::{ConnectionCache, Protocol},
+    },
     solana_clock::Slot,
     solana_cluster_type::ClusterType,
     solana_entry::poh::compute_hash_time,
     solana_epoch_schedule::MAX_LEADER_SCHEDULE_EPOCH_OFFSET,
     solana_genesis_config::GenesisConfig,
+    solana_genesis_utils::{
+        open_genesis_config, OpenGenesisConfigError, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
+    },
     solana_geyser_plugin_manager::{
         geyser_plugin_service::GeyserPluginService, GeyserPluginManagerRequest,
     },
@@ -79,10 +93,11 @@ use {
     },
     solana_measure::measure::Measure,
     solana_metrics::{datapoint_info, metrics::metrics_config_sanity_check},
-    solana_net_utils::multihomed_sockets::EgressSocketSelect,
     solana_poh::{
+        poh_controller::PohController,
         poh_recorder::PohRecorder,
         poh_service::{self, PohService},
+        record_channels::record_channels,
         transaction_recorder::TransactionRecorder,
     },
     solana_pubkey::Pubkey,
@@ -96,7 +111,7 @@ use {
         rpc::JsonRpcConfig,
         rpc_completed_slots_service::RpcCompletedSlotsService,
         rpc_pubsub_service::{PubSubConfig, PubSubService},
-        rpc_service::{ClientOption, JsonRpcService, JsonRpcServiceConfig},
+        rpc_service::{JsonRpcService, JsonRpcServiceConfig},
         rpc_subscriptions::RpcSubscriptions,
         transaction_notifier_interface::TransactionNotifierArc,
         transaction_status_service::TransactionStatusService,
@@ -112,17 +127,19 @@ use {
         dependency_tracker::DependencyTracker,
         prioritization_fee_cache::PrioritizationFeeCache,
         runtime_config::RuntimeConfig,
-        snapshot_archive_info::SnapshotArchiveInfoGetter,
         snapshot_bank_utils,
-        snapshot_config::SnapshotConfig,
         snapshot_controller::SnapshotController,
-        snapshot_hash::StartingSnapshotHashes,
-        snapshot_utils::{self, clean_orphaned_account_snapshot_dirs, SnapshotInterval},
+        snapshot_utils::{self, clean_orphaned_account_snapshot_dirs},
     },
     solana_send_transaction_service::send_transaction_service::Config as SendTransactionServiceConfig,
     solana_shred_version::compute_shred_version,
     solana_signer::Signer,
-    solana_streamer::{quic::QuicServerParams, socket::SocketAddrSpace, streamer::StakedNodes},
+    solana_streamer::{
+        nonblocking::{simple_qos::SimpleQosConfig, swqos::SwQosConfig},
+        quic::{QuicStreamerConfig, SimpleQosQuicStreamerConfig, SwQosQuicStreamerConfig},
+        socket::SocketAddrSpace,
+        streamer::StakedNodes,
+    },
     solana_time_utils::timestamp,
     solana_tpu_client::tpu_client::{
         DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_TPU_USE_QUIC, DEFAULT_VOTE_USE_QUIC,
@@ -134,14 +151,15 @@ use {
     },
     solana_unified_scheduler_pool::DefaultSchedulerPool,
     solana_validator_exit::Exit,
-    solana_vote_program::vote_state,
+    solana_vote_program::vote_state::VoteStateV4,
     solana_wen_restart::wen_restart::{wait_for_wen_restart, WenRestartConfig},
     std::{
         borrow::Cow,
         collections::{HashMap, HashSet},
         net::SocketAddr,
-        num::NonZeroUsize,
+        num::{NonZeroU64, NonZeroUsize},
         path::{Path, PathBuf},
+        str::FromStr,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, Mutex, RwLock,
@@ -152,7 +170,7 @@ use {
     strum::VariantNames,
     strum_macros::{Display, EnumCount, EnumIter, EnumString, EnumVariantNames, IntoStaticStr},
     thiserror::Error,
-    tokio::runtime::Runtime as TokioRuntime,
+    tokio::{runtime::Runtime as TokioRuntime, sync::mpsc},
     tokio_util::sync::CancellationToken,
 };
 
@@ -242,7 +260,43 @@ impl TransactionStructure {
     }
 
     pub fn cli_message() -> &'static str {
-        "Switch internal transaction structure/representation"
+        "DEPRECATED: has no impact on banking stage; will be removed in a future version"
+    }
+}
+
+#[derive(
+    Clone, Debug, EnumVariantNames, IntoStaticStr, Display, Serialize, Deserialize, PartialEq, Eq,
+)]
+#[strum(serialize_all = "kebab-case")]
+#[serde(rename_all = "kebab-case")]
+pub enum SchedulerPacing {
+    Disabled,
+    FillTimeMillis(NonZeroU64),
+}
+
+impl FromStr for SchedulerPacing {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("disabled") {
+            Ok(SchedulerPacing::Disabled)
+        } else {
+            match s.parse::<u64>() {
+                Ok(v) if v > 0 => Ok(SchedulerPacing::FillTimeMillis(
+                    NonZeroU64::new(v).ok_or_else(|| "value must be non-zero".to_string())?,
+                )),
+                _ => Err("value must be a positive integer or 'disabled'".to_string()),
+            }
+        }
+    }
+}
+
+impl SchedulerPacing {
+    pub fn fill_time(&self) -> Option<Duration> {
+        match self {
+            SchedulerPacing::Disabled => None,
+            SchedulerPacing::FillTimeMillis(millis) => Some(Duration::from_millis(millis.get())),
+        }
     }
 }
 
@@ -294,14 +348,14 @@ pub struct ValidatorConfig {
     pub no_os_network_stats_reporting: bool,
     pub no_os_cpu_stats_reporting: bool,
     pub no_os_disk_stats_reporting: bool,
+    pub enforce_ulimit_nofile: bool,
     pub poh_pinned_cpu_core: usize,
     pub poh_hashes_per_batch: u64,
     pub process_ledger_before_services: bool,
-    pub accounts_db_config: Option<AccountsDbConfig>,
+    pub accounts_db_config: AccountsDbConfig,
     pub warp_slot: Option<Slot>,
     pub accounts_db_skip_shrink: bool,
     pub accounts_db_force_initial_clean: bool,
-    pub tpu_coalesce: Duration,
     pub staked_nodes_overrides: Arc<RwLock<HashMap<Pubkey, u64>>>,
     pub validator_exit: Arc<RwLock<Exit>>,
     pub validator_exit_backpressure: HashMap<String, Arc<AtomicBool>>,
@@ -312,8 +366,9 @@ pub struct ValidatorConfig {
     pub block_verification_method: BlockVerificationMethod,
     pub block_production_method: BlockProductionMethod,
     pub block_production_num_workers: NonZeroUsize,
-    pub transaction_struct: TransactionStructure,
+    pub block_production_scheduler_config: SchedulerConfig,
     pub enable_block_production_forwarding: bool,
+    pub enable_scheduler_bindings: bool,
     pub generator_config: Option<GeneratorConfig>,
     pub use_snapshot_archives_at_startup: UseSnapshotArchivesAtStartup,
     pub wen_restart_proto_path: Option<PathBuf>,
@@ -373,27 +428,29 @@ impl ValidatorConfig {
             no_os_network_stats_reporting: true,
             no_os_cpu_stats_reporting: true,
             no_os_disk_stats_reporting: true,
+            // No need to enforce nofile limit in tests
+            enforce_ulimit_nofile: false,
             poh_pinned_cpu_core: poh_service::DEFAULT_PINNED_CPU_CORE,
             poh_hashes_per_batch: poh_service::DEFAULT_HASHES_PER_BATCH,
             process_ledger_before_services: false,
             warp_slot: None,
             accounts_db_skip_shrink: false,
             accounts_db_force_initial_clean: false,
-            tpu_coalesce: DEFAULT_TPU_COALESCE,
             staked_nodes_overrides: Arc::new(RwLock::new(HashMap::new())),
             validator_exit: Arc::new(RwLock::new(Exit::default())),
             validator_exit_backpressure: HashMap::default(),
             no_wait_for_vote_to_start_leader: true,
-            accounts_db_config: Some(ACCOUNTS_DB_CONFIG_FOR_TESTING),
+            accounts_db_config: ACCOUNTS_DB_CONFIG_FOR_TESTING,
             wait_to_vote_slot: None,
             runtime_config: RuntimeConfig::default(),
             banking_trace_dir_byte_limit: 0,
             block_verification_method: BlockVerificationMethod::default(),
             block_production_method: BlockProductionMethod::default(),
             block_production_num_workers: BankingStage::default_num_workers(),
-            transaction_struct: TransactionStructure::default(),
+            block_production_scheduler_config: SchedulerConfig::default(),
             // enable forwarding by default for tests
             enable_block_production_forwarding: true,
+            enable_scheduler_bindings: false,
             generator_config: None,
             use_snapshot_archives_at_startup: UseSnapshotArchivesAtStartup::default(),
             wen_restart_proto_path: None,
@@ -430,8 +487,9 @@ impl ValidatorConfig {
 // `ValidatorStartProgress` contains status information that is surfaced to the node operator over
 // the admin RPC channel to help them to follow the general progress of node startup without
 // having to watch log messages.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum ValidatorStartProgress {
+    #[default]
     Initializing, // Catch all, default state
     SearchingForRpcService,
     DownloadingSnapshot {
@@ -455,12 +513,6 @@ pub enum ValidatorStartProgress {
     // `Running` is the terminal state once the validator fully starts and all services are
     // operational
     Running,
-}
-
-impl Default for ValidatorStartProgress {
-    fn default() -> Self {
-        Self::Initializing
-    }
 }
 
 struct BlockstoreRootScan {
@@ -512,32 +564,43 @@ pub struct ValidatorTpuConfig {
     /// Controls if to enable UDP for TPU tansactions.
     pub tpu_enable_udp: bool,
     /// QUIC server config for regular TPU
-    pub tpu_quic_server_config: QuicServerParams,
+    pub tpu_quic_server_config: SwQosQuicStreamerConfig,
     /// QUIC server config for TPU forward
-    pub tpu_fwd_quic_server_config: QuicServerParams,
+    pub tpu_fwd_quic_server_config: SwQosQuicStreamerConfig,
     /// QUIC server config for Vote
-    pub vote_quic_server_config: QuicServerParams,
+    pub vote_quic_server_config: SimpleQosQuicStreamerConfig,
 }
 
 impl ValidatorTpuConfig {
     /// A convenient function to build a ValidatorTpuConfig for testing with good
     /// default.
     pub fn new_for_tests(tpu_enable_udp: bool) -> Self {
-        let tpu_quic_server_config = QuicServerParams {
-            max_connections_per_ipaddr_per_min: 32,
-            coalesce_channel_size: 100_000, // smaller channel size for faster test
-            ..Default::default()
+        let tpu_quic_server_config = SwQosQuicStreamerConfig {
+            quic_streamer_config: QuicStreamerConfig {
+                max_connections_per_ipaddr_per_min: 32,
+                ..Default::default()
+            },
+            qos_config: SwQosConfig::default(),
         };
 
-        let tpu_fwd_quic_server_config = QuicServerParams {
-            max_connections_per_ipaddr_per_min: 32,
-            max_unstaked_connections: 0,
-            coalesce_channel_size: 100_000, // smaller channel size for faster test
-            ..Default::default()
+        let tpu_fwd_quic_server_config = SwQosQuicStreamerConfig {
+            quic_streamer_config: QuicStreamerConfig {
+                max_connections_per_ipaddr_per_min: 32,
+                max_unstaked_connections: 0,
+                ..Default::default()
+            },
+            qos_config: SwQosConfig::default(),
         };
 
         // vote and tpu_fwd share the same characteristics -- disallow non-staked connections:
-        let vote_quic_server_config = tpu_fwd_quic_server_config.clone();
+        let vote_quic_server_config = SimpleQosQuicStreamerConfig {
+            quic_streamer_config: QuicStreamerConfig {
+                max_connections_per_ipaddr_per_min: 32,
+                max_unstaked_connections: 0,
+                ..Default::default()
+            },
+            qos_config: SimpleQosConfig::default(),
+        };
 
         ValidatorTpuConfig {
             use_quic: DEFAULT_TPU_USE_QUIC,
@@ -607,6 +670,12 @@ impl Validator {
         tpu_config: ValidatorTpuConfig,
         admin_rpc_service_post_init: Arc<RwLock<Option<AdminRpcRequestMetadataPostInit>>>,
     ) -> Result<Self> {
+        #[cfg(debug_assertions)]
+        const DEBUG_ASSERTION_STATUS: &str = "enabled";
+        #[cfg(not(debug_assertions))]
+        const DEBUG_ASSERTION_STATUS: &str = "disabled";
+        info!("debug-assertion status: {DEBUG_ASSERTION_STATUS}");
+
         let ValidatorTpuConfig {
             use_quic,
             vote_use_quic,
@@ -618,6 +687,8 @@ impl Validator {
         } = tpu_config;
 
         let start_time = Instant::now();
+
+        adjust_nofile_limit(config.enforce_ulimit_nofile)?;
 
         // Initialize the global rayon pool first to ensure the value in config
         // is honored. Otherwise, some code accessing the global pool could
@@ -698,6 +769,8 @@ impl Validator {
         sigverify::init();
         info!("Initializing sigverify done.");
 
+        validate_memlock_limit_for_disk_io(config.accounts_db_config.memlock_budget_size)?;
+
         if !ledger_path.is_dir() {
             return Err(anyhow!(
                 "ledger directory does not exist or is not accessible: {ledger_path:?}"
@@ -728,8 +801,8 @@ impl Validator {
         timer.stop();
         info!("Cleaning orphaned account snapshot directories done. {timer}");
 
-        // token used to cancel tpu-client-next.
-        let cancel_tpu_client_next = CancellationToken::new();
+        // token used to cancel tpu-client-next and streamer.
+        let cancel = CancellationToken::new();
         {
             let exit = exit.clone();
             config
@@ -737,12 +810,12 @@ impl Validator {
                 .write()
                 .unwrap()
                 .register_exit(Box::new(move || exit.store(true, Ordering::Relaxed)));
-            let cancel_tpu_client_next = cancel_tpu_client_next.clone();
+            let cancel = cancel.clone();
             config
                 .validator_exit
                 .write()
                 .unwrap()
-                .register_exit(Box::new(move || cancel_tpu_client_next.cancel()));
+                .register_exit(Box::new(move || cancel.cancel()));
         }
 
         let (
@@ -866,11 +939,6 @@ impl Validator {
         cluster_info.set_entrypoints(cluster_entrypoints);
         cluster_info.restore_contact_info(ledger_path, config.contact_save_interval);
         cluster_info.set_bind_ip_addrs(node.bind_ip_addrs.clone());
-        let tvu_sockets_per_interface =
-            node.sockets.retransmit_sockets.len() / node.bind_ip_addrs.len();
-        cluster_info.init_egress_socket_select(Arc::new(EgressSocketSelect::new(
-            tvu_sockets_per_interface,
-        )));
         let cluster_info = Arc::new(cluster_info);
         let node_multihoming = Arc::new(NodeMultihoming::from(&node));
 
@@ -924,11 +992,8 @@ impl Validator {
             },
         );
         info!(
-            "Using: block-verification-method: {}, block-production-method: {}, \
-             transaction-structure: {}",
-            config.block_verification_method,
-            config.block_production_method,
-            config.transaction_struct
+            "Using: block-verification-method: {}, block-production-method: {}",
+            config.block_verification_method, config.block_production_method,
         );
 
         let (replay_vote_sender, replay_vote_receiver) = unbounded();
@@ -938,10 +1003,8 @@ impl Validator {
         let prioritization_fee_cache = Arc::new(PrioritizationFeeCache::default());
 
         let leader_schedule_cache = Arc::new(leader_schedule_cache);
-        let startup_verification_complete;
-        let (mut poh_recorder, entry_receiver) = {
+        let (poh_recorder, entry_receiver) = {
             let bank = &bank_forks.read().unwrap().working_bank();
-            startup_verification_complete = Arc::clone(bank.get_startup_verification_complete());
             PohRecorder::new_with_clear_signal(
                 bank.tick_height(),
                 bank.last_blockhash(),
@@ -956,13 +1019,10 @@ impl Validator {
                 exit.clone(),
             )
         };
-        if transaction_status_sender.is_some() {
-            poh_recorder.track_transaction_indexes();
-        }
-        let (record_sender, record_receiver) = unbounded();
-        let transaction_recorder =
-            TransactionRecorder::new(record_sender, poh_recorder.is_exited.clone());
+        let (record_sender, record_receiver) = record_channels(transaction_status_sender.is_some());
+        let transaction_recorder = TransactionRecorder::new(record_sender);
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
+        let (poh_controller, poh_service_message_receiver) = PohController::new();
 
         let (banking_tracer, tracer_thread) =
             BankingTracer::new((config.banking_trace_dir_byte_limit > 0).then_some((
@@ -1177,7 +1237,7 @@ impl Validator {
                     Arc::as_ref(&identity_keypair),
                     node.sockets.rpc_sts_client,
                     runtime_handle.clone(),
-                    cancel_tpu_client_next.clone(),
+                    cancel.clone(),
                 )
             } else {
                 let Some(connection_cache) = &connection_cache else {
@@ -1199,7 +1259,6 @@ impl Validator {
                 validator_exit: config.validator_exit.clone(),
                 exit: exit.clone(),
                 override_health_check: rpc_override_health_check.clone(),
-                startup_verification_complete,
                 optimistically_confirmed_bank: optimistically_confirmed_bank.clone(),
                 send_transaction_service_config: config.send_transaction_service_config.clone(),
                 max_slots: max_slots.clone(),
@@ -1375,6 +1434,7 @@ impl Validator {
             config.poh_pinned_cpu_core,
             config.poh_hashes_per_batch,
             record_receiver,
+            poh_service_message_receiver,
         );
         assert_eq!(
             blockstore.get_new_shred_signals_len(),
@@ -1497,8 +1557,13 @@ impl Validator {
 
         let outstanding_repair_requests =
             Arc::<RwLock<repair::repair_service::OutstandingShredRepairs>>::default();
-        let cluster_slots =
-            Arc::new(crate::cluster_slots_service::cluster_slots::ClusterSlots::default());
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let cluster_slots = Arc::new({
+            crate::cluster_slots_service::cluster_slots::ClusterSlots::new(
+                &root_bank,
+                &cluster_info,
+            )
+        });
 
         // If RPC is supported and ConnectionCache is used, pass ConnectionCache for being warmup inside Tvu.
         let connection_cache_for_warmup =
@@ -1545,6 +1610,7 @@ impl Validator {
             ledger_signal_receiver,
             rpc_subscriptions.clone(),
             &poh_recorder,
+            poh_controller,
             tower,
             config.tower_storage.clone(),
             &leader_schedule_cache,
@@ -1626,10 +1692,11 @@ impl Validator {
                 Arc::as_ref(&identity_keypair),
                 tpu_transactions_forwards_client_sockets.take().unwrap(),
                 runtime_handle.clone(),
-                cancel_tpu_client_next,
+                cancel.clone(),
                 node_multihoming.clone(),
             ))
         };
+        let (banking_control_sender, banking_control_reciever) = mpsc::channel(1);
         let tpu = Tpu::new_with_client(
             &cluster_info,
             &poh_recorder,
@@ -1662,7 +1729,6 @@ impl Validator {
             replay_vote_receiver,
             replay_vote_sender,
             bank_notification_sender,
-            config.tpu_coalesce,
             duplicate_confirmed_slot_sender,
             forwarding_tpu_client,
             turbine_quic_endpoint_sender,
@@ -1679,10 +1745,18 @@ impl Validator {
             &prioritization_fee_cache,
             config.block_production_method.clone(),
             config.block_production_num_workers,
-            config.transaction_struct.clone(),
+            config.block_production_scheduler_config.clone(),
             config.enable_block_production_forwarding,
             config.generator_config.clone(),
             key_notifiers.clone(),
+            banking_control_reciever,
+            config.enable_scheduler_bindings.then(|| {
+                (
+                    ledger_path.join("scheduler_bindings.ipc"),
+                    banking_control_sender.clone(),
+                )
+            }),
+            cancel,
         );
 
         datapoint_info!(
@@ -1717,7 +1791,7 @@ impl Validator {
             outstanding_repair_requests,
             cluster_slots,
             node: Some(node_multihoming),
-            banking_stage: tpu.banking_stage(),
+            banking_control_sender,
         });
 
         Ok(Self {
@@ -1906,7 +1980,7 @@ impl Validator {
 
 fn active_vote_account_exists_in_bank(bank: &Bank, vote_account: &Pubkey) -> bool {
     if let Some(account) = &bank.get_account(vote_account) {
-        if let Some(vote_state) = vote_state::from(account) {
+        if let Ok(vote_state) = VoteStateV4::deserialize(account.data(), vote_account) {
             return !vote_state.votes.is_empty();
         }
     }
@@ -2363,9 +2437,7 @@ fn maybe_warp_slot(
             &Pubkey::default(),
             warp_slot,
         ));
-        bank_forks
-            .set_root(warp_slot, Some(snapshot_controller), Some(warp_slot))
-            .map_err(|err| err.to_string())?;
+        bank_forks.set_root(warp_slot, Some(snapshot_controller), Some(warp_slot));
         leader_schedule_cache.set_root(&bank_forks.root_bank());
 
         let full_snapshot_archive_info = match snapshot_bank_utils::bank_to_full_snapshot_archive(
@@ -2610,6 +2682,9 @@ pub enum ValidatorError {
     )]
     PohTooSlow { mine: u64, target: u64 },
 
+    #[error(transparent)]
+    ResourceLimitError(#[from] ResourceLimitError),
+
     #[error("shred version mismatch: actual {actual}, expected {expected}")]
     ShredVersionMismatch { actual: u16, expected: u16 },
 
@@ -2798,11 +2873,7 @@ fn cleanup_accounts_paths(config: &ValidatorConfig) {
     for account_path in &config.account_paths {
         move_and_async_delete_path_contents(account_path);
     }
-    if let Some(shrink_paths) = config
-        .accounts_db_config
-        .as_ref()
-        .and_then(|config| config.shrink_paths.as_ref())
-    {
+    if let Some(shrink_paths) = &config.accounts_db_config.shrink_paths {
         for shrink_path in shrink_paths {
             move_and_async_delete_path_contents(shrink_path);
         }
@@ -2850,7 +2921,7 @@ mod tests {
 
     #[test]
     fn validator_exit() {
-        solana_logger::setup();
+        agave_logger::setup();
         let leader_keypair = Keypair::new();
         let leader_node = Node::new_localhost_with_pubkey(&leader_keypair.pubkey());
 
@@ -2896,7 +2967,7 @@ mod tests {
 
     #[test]
     fn test_should_cleanup_blockstore_incorrect_shred_versions() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
@@ -3031,7 +3102,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_blockstore_incorrect_shred_versions() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         let validator_config = ValidatorConfig::default_for_test();
         let ledger_path = get_tmp_ledger_path_auto_delete!();
@@ -3127,7 +3198,7 @@ mod tests {
 
     #[test]
     fn test_wait_for_supermajority() {
-        solana_logger::setup();
+        agave_logger::setup();
         let node_keypair = Arc::new(Keypair::new());
         let cluster_info = ClusterInfo::new(
             ContactInfo::new_localhost(&node_keypair.pubkey(), timestamp()),
@@ -3274,7 +3345,7 @@ mod tests {
 
     #[test]
     fn test_poh_speed() {
-        solana_logger::setup();
+        agave_logger::setup();
         let poh_config = PohConfig {
             target_tick_duration: target_tick_duration(),
             // make PoH rate really fast to cause the panic condition
@@ -3291,7 +3362,7 @@ mod tests {
 
     #[test]
     fn test_poh_speed_no_hashes_per_tick() {
-        solana_logger::setup();
+        agave_logger::setup();
         let poh_config = PohConfig {
             target_tick_duration: target_tick_duration(),
             hashes_per_tick: None,

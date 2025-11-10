@@ -52,9 +52,6 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --rpc-pubsub-enable-block-subscription ]]; then
       args+=("$1")
       shift
-    elif [[ $1 = --enable-cpi-and-log-storage ]]; then
-      args+=("$1")
-      shift
     elif [[ $1 = --enable-extended-tx-metadata-storage ]]; then
       args+=("$1")
       shift
@@ -112,6 +109,9 @@ while [[ -n $1 ]]; do
     elif [[ $1 == --block-production-method ]]; then
       args+=("$1" "$2")
       shift 2
+    elif [[ $1 == --enable-scheduler-bindings ]]; then
+      args+=("$1")
+      shift
     elif [[ $1 == --transaction-structure ]]; then
       args+=("$1" "$2")
       shift 2

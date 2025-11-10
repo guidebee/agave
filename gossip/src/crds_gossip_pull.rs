@@ -27,6 +27,7 @@ use {
         Rng,
     },
     rayon::{prelude::*, ThreadPool},
+    serde::{Deserialize, Serialize},
     solana_bloom::bloom::{Bloom, ConcurrentBloom},
     solana_hash::Hash,
     solana_keypair::Keypair,
@@ -245,7 +246,8 @@ impl CrdsGossipPull {
         ping_cache: &Mutex<PingCache>,
         pings: &mut Vec<(SocketAddr, Ping)>,
         socket_addr_space: &SocketAddrSpace,
-    ) -> Result<impl Iterator<Item = (SocketAddr, CrdsFilter)> + Clone, CrdsGossipError> {
+    ) -> Result<impl Iterator<Item = (SocketAddr, CrdsFilter)> + Clone + use<>, CrdsGossipError>
+    {
         let mut rng = rand::thread_rng();
         // Active and valid gossip nodes with matching shred-version.
         let nodes = crds_gossip::get_gossip_nodes(

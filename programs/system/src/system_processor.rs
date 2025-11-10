@@ -17,7 +17,10 @@ use {
     solana_system_interface::{
         error::SystemError, instruction::SystemInstruction, MAX_PERMITTED_DATA_LENGTH,
     },
-    solana_transaction_context::{BorrowedAccount, IndexOfAccount, InstructionContext},
+    solana_transaction_context::{
+        instruction::InstructionContext, instruction_accounts::BorrowedInstructionAccount,
+        IndexOfAccount,
+    },
     std::collections::HashSet,
 };
 
@@ -70,7 +73,7 @@ impl Address {
 }
 
 fn allocate(
-    account: &mut BorrowedAccount,
+    account: &mut BorrowedInstructionAccount,
     address: &Address,
     space: u64,
     signers: &HashSet<Pubkey>,
@@ -112,7 +115,7 @@ fn allocate(
 }
 
 fn assign(
-    account: &mut BorrowedAccount,
+    account: &mut BorrowedInstructionAccount,
     address: &Address,
     owner: &Pubkey,
     signers: &HashSet<Pubkey>,
@@ -132,7 +135,7 @@ fn assign(
 }
 
 fn allocate_and_assign(
-    to: &mut BorrowedAccount,
+    to: &mut BorrowedInstructionAccount,
     to_address: &Address,
     space: u64,
     owner: &Pubkey,
@@ -1234,7 +1237,7 @@ mod tests {
             &data,
             Vec::new(),
             Vec::new(),
-            Err(InstructionError::NotEnoughAccountKeys),
+            Err(InstructionError::MissingAccount),
         );
 
         // Attempt to transfer with no destination
@@ -1250,7 +1253,7 @@ mod tests {
                 is_signer: true,
                 is_writable: false,
             }],
-            Err(InstructionError::NotEnoughAccountKeys),
+            Err(InstructionError::MissingAccount),
         );
     }
 
@@ -1484,7 +1487,7 @@ mod tests {
             &serialize(&SystemInstruction::AdvanceNonceAccount).unwrap(),
             Vec::new(),
             Vec::new(),
-            Err(InstructionError::NotEnoughAccountKeys),
+            Err(InstructionError::MissingAccount),
         );
     }
 
@@ -1499,7 +1502,7 @@ mod tests {
                 is_signer: true,
                 is_writable: true,
             }],
-            Err(InstructionError::NotEnoughAccountKeys),
+            Err(InstructionError::MissingAccount),
         );
     }
 
@@ -1590,7 +1593,7 @@ mod tests {
             &serialize(&SystemInstruction::WithdrawNonceAccount(42)).unwrap(),
             Vec::new(),
             Vec::new(),
-            Err(InstructionError::NotEnoughAccountKeys),
+            Err(InstructionError::MissingAccount),
         );
     }
 
@@ -1605,7 +1608,7 @@ mod tests {
                 is_signer: true,
                 is_writable: true,
             }],
-            Err(InstructionError::NotEnoughAccountKeys),
+            Err(InstructionError::MissingAccount),
         );
     }
 
@@ -1656,7 +1659,7 @@ mod tests {
             &serialize(&SystemInstruction::InitializeNonceAccount(Pubkey::default())).unwrap(),
             Vec::new(),
             Vec::new(),
-            Err(InstructionError::NotEnoughAccountKeys),
+            Err(InstructionError::MissingAccount),
         );
     }
 
@@ -1672,7 +1675,7 @@ mod tests {
                 is_signer: true,
                 is_writable: true,
             }],
-            Err(InstructionError::NotEnoughAccountKeys),
+            Err(InstructionError::MissingAccount),
         );
     }
 

@@ -105,7 +105,7 @@ pub fn spawn_shred_sigverify(
             }
             // We can't store the keypair outside the loop
             // because the identity might be hot swapped.
-            let keypair: Arc<Keypair> = cluster_info.keypair().clone();
+            let keypair = cluster_info.keypair();
             match run_shred_sigverify(
                 &thread_pool,
                 &keypair,
@@ -599,7 +599,7 @@ mod tests {
             &leader_keypair,
             &entries,
             true,
-            Some(Hash::new_unique()),
+            Hash::new_unique(),
             0,
             0,
             &ReedSolomonCache::default(),
@@ -609,7 +609,7 @@ mod tests {
             &wrong_keypair,
             &entries,
             true,
-            Some(Hash::new_unique()),
+            Hash::new_unique(),
             0,
             0,
             &ReedSolomonCache::default(),
@@ -662,8 +662,7 @@ mod tests {
             let bank_forks = bank_forks.read().unwrap();
             (bank_forks.working_bank(), bank_forks.root_bank())
         };
-
-        let chained_merkle_root = Some(Hash::new_from_array(rng.gen()));
+        let chained_merkle_root = Hash::new_from_array(rng.gen());
 
         let shredder = Shredder::new(root_bank.slot(), root_bank.parent_slot(), 0, 0).unwrap();
         let entries = vec![Entry::new(&Hash::default(), 0, vec![])];

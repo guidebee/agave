@@ -8,7 +8,7 @@ use {
         restart_crds_values::{RestartHeaviestFork, RestartLastVotedForkSlots},
     },
     rand::Rng,
-    serde::de::{Deserialize, Deserializer},
+    serde::{de::Deserializer, Deserialize, Serialize},
     solana_clock::Slot,
     solana_hash::Hash,
     solana_pubkey::{self, Pubkey},
@@ -16,7 +16,7 @@ use {
     solana_time_utils::timestamp,
     solana_transaction::Transaction,
     solana_vote::vote_parser,
-    std::{cmp::Ordering, collections::BTreeSet},
+    std::collections::BTreeSet,
 };
 
 pub(crate) const MAX_WALLCLOCK: u64 = 1_000_000_000_000_000;
@@ -45,18 +45,21 @@ pub enum CrdsData {
     #[allow(private_interfaces)]
     LegacyContactInfo(LegacyContactInfo),
     Vote(VoteIndex, Vote),
-    LowestSlot(/*DEPRECATED:*/ u8, LowestSlot),
+    LowestSlot(
+        #[serde(deserialize_with = "reject_nonzero_u8")] u8, // u8 is deprecated
+        LowestSlot,
+    ),
     #[allow(private_interfaces)]
     LegacySnapshotHashes(LegacySnapshotHashes), // Deprecated
     #[allow(private_interfaces)]
     AccountsHashes(AccountsHashes), // Deprecated
     EpochSlots(EpochSlotsIndex, EpochSlots),
     #[allow(private_interfaces)]
-    LegacyVersion(LegacyVersion),
+    LegacyVersion(LegacyVersion), // Deprecated
     #[allow(private_interfaces)]
-    Version(Version),
+    Version(Version), // Deprecated
     #[allow(private_interfaces)]
-    NodeInstance(NodeInstance),
+    NodeInstance(NodeInstance), // Deprecated
     DuplicateShred(DuplicateShredIndex, DuplicateShred),
     SnapshotHashes(SnapshotHashes),
     ContactInfo(ContactInfo),
@@ -213,12 +216,13 @@ impl From<&ContactInfo> for CrdsData {
 }
 
 #[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AccountsHashes {
     pub(crate) from: Pubkey,
     pub(crate) hashes: Vec<(Slot, Hash)>,
     pub(crate) wallclock: u64,
 }
+reject_deserialize!(AccountsHashes, "AccountsHashes is deprecated");
 
 impl Sanitize for AccountsHashes {
     fn sanitize(&self) -> Result<(), SanitizeError> {
@@ -335,6 +339,21 @@ impl Sanitize for LowestSlot {
     }
 }
 
+fn reject_nonzero_u8<'de, D>(de: D) -> Result<u8, D::Error>
+where
+    D: Deserializer<'de>,
+    D::Error: serde::de::Error,
+{
+    let v = u8::deserialize(de)?;
+    if v == 0 {
+        Ok(v)
+    } else {
+        Err(serde::de::Error::custom(
+            "LowestSlot tag != 0 is deprecated",
+        ))
+    }
+}
+
 #[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Vote {
@@ -404,12 +423,13 @@ impl<'de> Deserialize<'de> for Vote {
 }
 
 #[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LegacyVersion {
     from: Pubkey,
     wallclock: u64,
     version: solana_version::LegacyVersion1,
 }
+reject_deserialize!(LegacyVersion, "LegacyVersion is deprecated");
 
 impl Sanitize for LegacyVersion {
     fn sanitize(&self) -> Result<(), SanitizeError> {
@@ -420,12 +440,13 @@ impl Sanitize for LegacyVersion {
 }
 
 #[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Version {
     from: Pubkey,
     wallclock: u64,
     version: solana_version::LegacyVersion2,
 }
+reject_deserialize!(Version, "Version is deprecated");
 
 impl Sanitize for Version {
     fn sanitize(&self) -> Result<(), SanitizeError> {
@@ -436,50 +457,14 @@ impl Sanitize for Version {
 }
 
 #[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct NodeInstance {
     from: Pubkey,
     wallclock: u64,
     timestamp: u64, // Timestamp when the instance was created.
     token: u64,     // Randomly generated value at node instantiation.
 }
-
-impl NodeInstance {
-    #[cfg(test)]
-    pub(crate) fn new<R>(rng: &mut R, from: Pubkey, now: u64) -> Self
-    where
-        R: Rng + rand::CryptoRng,
-    {
-        Self {
-            from,
-            wallclock: now,
-            timestamp: now,
-            token: rng.gen(),
-        }
-    }
-
-    #[cfg(test)]
-    // Clones the value with an updated wallclock.
-    pub(crate) fn with_wallclock(&self, wallclock: u64) -> Self {
-        Self { wallclock, ..*self }
-    }
-
-    // Returns None if tokens are the same or other is not a node-instance from
-    // the same owner. Otherwise returns true if self has more recent timestamp
-    // than other, and so overrides it.
-    pub(crate) fn overrides(&self, other: &NodeInstance) -> Option<bool> {
-        if self.token == other.token || self.from != other.from {
-            return None;
-        }
-        match self.timestamp.cmp(&other.timestamp) {
-            Ordering::Less => Some(false),
-            Ordering::Greater => Some(true),
-            // Ties should be broken in a deterministic way across the cluster,
-            // so that nodes propagate the same value through gossip.
-            Ordering::Equal => Some(other.token < self.token),
-        }
-    }
-}
+reject_deserialize!(NodeInstance, "NodeInstance is deprecated");
 
 impl Sanitize for NodeInstance {
     fn sanitize(&self) -> Result<(), SanitizeError> {
@@ -495,6 +480,21 @@ pub(crate) fn sanitize_wallclock(wallclock: u64) -> Result<(), SanitizeError> {
         Ok(())
     }
 }
+
+macro_rules! reject_deserialize {
+    ($ty:ty, $msg:expr) => {
+        impl<'de> serde::Deserialize<'de> for $ty {
+            fn deserialize<D>(_de: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+                D::Error: serde::de::Error,
+            {
+                Err(serde::de::Error::custom($msg))
+            }
+        }
+    };
+}
+pub(crate) use reject_deserialize;
 
 #[cfg(test)]
 mod test {
@@ -591,119 +591,85 @@ mod test {
     }
 
     #[test]
-    fn test_node_instance_crds_label() {
-        fn make_crds_value(node: NodeInstance) -> CrdsValue {
-            CrdsValue::new_unsigned(CrdsData::NodeInstance(node))
-        }
-        let mut rng = rand::thread_rng();
-        let now = timestamp();
-        let pubkey = Pubkey::new_unique();
-        let node = NodeInstance::new(&mut rng, pubkey, now);
-        assert_eq!(
-            make_crds_value(node.clone()).label(),
-            make_crds_value(node.with_wallclock(now + 8)).label()
-        );
-        let other = NodeInstance {
-            from: Pubkey::new_unique(),
-            ..node
-        };
-        assert_ne!(
-            make_crds_value(node.clone()).label(),
-            make_crds_value(other).label()
-        );
-        let other = NodeInstance {
-            wallclock: now + 8,
-            ..node
-        };
-        assert_eq!(
-            make_crds_value(node.clone()).label(),
-            make_crds_value(other).label()
-        );
-        let other = NodeInstance {
-            timestamp: now + 8,
-            ..node
-        };
-        assert_eq!(
-            make_crds_value(node.clone()).label(),
-            make_crds_value(other).label()
-        );
-        let other = NodeInstance {
-            token: rng.gen(),
-            ..node
-        };
-        assert_eq!(
-            make_crds_value(node).label(),
-            make_crds_value(other).label()
-        );
-    }
+    fn test_deprecated_values_fail_deserialization() {
+        let keypair = Keypair::new();
 
-    #[test]
-    fn test_check_duplicate_instance() {
-        let now = timestamp();
+        // NodeInstance
+        let node_instance = CrdsData::NodeInstance(NodeInstance {
+            from: keypair.pubkey(),
+            wallclock: timestamp(),
+            timestamp: 0,
+            token: 0,
+        });
+        let bytes = bincode::serialize(&node_instance).unwrap();
+        assert!(bincode::deserialize::<CrdsData>(&bytes[..]).is_err());
+
+        #[derive(serde::Serialize)]
+        struct LegacyVersion1Mirror {
+            major: u16,
+            minor: u16,
+            patch: u16,
+            commit: Option<u32>,
+        }
+
+        let legacy_v1: solana_version::LegacyVersion1 = {
+            let bytes = bincode::serialize(&LegacyVersion1Mirror {
+                major: 0,
+                minor: 0,
+                patch: 0,
+                commit: None,
+            })
+            .unwrap();
+            bincode::deserialize(&bytes).unwrap()
+        };
+
+        // LegacyVersion
+        let legacy_version = CrdsData::LegacyVersion(LegacyVersion {
+            from: keypair.pubkey(),
+            wallclock: timestamp(),
+            version: legacy_v1,
+        });
+        let bytes = bincode::serialize(&legacy_version).unwrap();
+        assert!(bincode::deserialize::<CrdsData>(&bytes[..]).is_err());
+
+        // Version
+        let version = CrdsData::Version(Version {
+            from: keypair.pubkey(),
+            wallclock: timestamp(),
+            version: solana_version::LegacyVersion2::default(),
+        });
+        let bytes = bincode::serialize(&version).unwrap();
+        assert!(bincode::deserialize::<CrdsData>(&bytes[..]).is_err());
+
+        // LegacyContactInfo
+        let legacy_contact_info = CrdsData::LegacyContactInfo(LegacyContactInfo::default());
+        let bytes = bincode::serialize(&legacy_contact_info).unwrap();
+        assert!(bincode::deserialize::<CrdsData>(&bytes[..]).is_err());
+
+        // AccountsHashes
         let mut rng = rand::thread_rng();
-        let pubkey = Pubkey::new_unique();
-        let node = NodeInstance::new(&mut rng, pubkey, now);
-        // Same token is not a duplicate.
-        let other = NodeInstance {
-            from: pubkey,
-            wallclock: now + 1,
-            timestamp: now + 1,
-            token: node.token,
-        };
-        assert_eq!(node.overrides(&other), None);
-        assert_eq!(other.overrides(&node), None);
-        // Older timestamp is not a duplicate.
-        let other = NodeInstance {
-            from: pubkey,
-            wallclock: now + 1,
-            timestamp: now - 1,
-            token: rng.gen(),
-        };
-        assert_eq!(node.overrides(&other), Some(true));
-        assert_eq!(other.overrides(&node), Some(false));
-        // Updated wallclock is not a duplicate.
-        let other = node.with_wallclock(now + 8);
-        assert_eq!(
-            other,
-            NodeInstance {
-                from: pubkey,
-                wallclock: now + 8,
-                timestamp: now,
-                token: node.token,
-            }
+        let accounts_hashes =
+            CrdsData::AccountsHashes(AccountsHashes::new_rand(&mut rng, Some(keypair.pubkey())));
+        let bytes = bincode::serialize(&accounts_hashes).unwrap();
+        assert!(bincode::deserialize::<CrdsData>(&bytes[..]).is_err());
+
+        // LegacySnapshotHashes
+        let legacy_snapshot_hashes = CrdsData::LegacySnapshotHashes(
+            LegacySnapshotHashes::new_rand(&mut rng, Some(keypair.pubkey())),
         );
-        assert_eq!(node.overrides(&other), None);
-        assert_eq!(other.overrides(&node), None);
-        // Duplicate instance; tied timestamp.
-        for _ in 0..10 {
-            let other = NodeInstance {
-                from: pubkey,
-                wallclock: 0,
-                timestamp: now,
-                token: rng.gen(),
-            };
-            assert_eq!(node.overrides(&other), Some(other.token < node.token));
-            assert_eq!(other.overrides(&node), Some(node.token < other.token));
-        }
-        // Duplicate instance; more recent timestamp.
-        for _ in 0..10 {
-            let other = NodeInstance {
-                from: pubkey,
-                wallclock: 0,
-                timestamp: now + 1,
-                token: rng.gen(),
-            };
-            assert_eq!(node.overrides(&other), Some(false));
-            assert_eq!(other.overrides(&node), Some(true));
-        }
-        // Different pubkey is not a duplicate.
-        let other = NodeInstance {
-            from: Pubkey::new_unique(),
-            wallclock: now + 1,
-            timestamp: now + 1,
-            token: rng.gen(),
-        };
-        assert_eq!(node.overrides(&other), None);
-        assert_eq!(other.overrides(&node), None);
+        let bytes = bincode::serialize(&legacy_snapshot_hashes).unwrap();
+        assert!(bincode::deserialize::<CrdsData>(&bytes[..]).is_err());
+
+        // LowestSlot(1, ...)
+        let lowest_slot =
+            CrdsData::LowestSlot(1, LowestSlot::new(keypair.pubkey(), 0, timestamp()));
+        let bytes = bincode::serialize(&lowest_slot).unwrap();
+        assert!(bincode::deserialize::<CrdsData>(&bytes[..]).is_err());
+
+        // LowestSlot(0, ...) -> should be deserialized successfully
+        let lowest_slot =
+            CrdsData::LowestSlot(0, LowestSlot::new(keypair.pubkey(), 0, timestamp()));
+        let bytes = bincode::serialize(&lowest_slot).unwrap();
+        assert!(bincode::deserialize::<CrdsData>(&bytes[..]).is_ok());
     }
 }

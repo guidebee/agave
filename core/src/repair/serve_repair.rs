@@ -24,6 +24,7 @@ use {
         distributions::{Distribution, WeightedError, WeightedIndex},
         Rng,
     },
+    serde::{Deserialize, Serialize},
     solana_clock::Slot,
     solana_cluster_type::ClusterType,
     solana_gossip::{
@@ -229,7 +230,7 @@ type PingCache = ping_pong::PingCache<REPAIR_PING_TOKEN_SIZE>;
 #[cfg_attr(
     feature = "frozen-abi",
     derive(AbiEnumVisitor, AbiExample),
-    frozen_abi(digest = "FGw38CCo7vg24qxe7TfGP11WdX2poe6T55BGN1r3XMFA")
+    frozen_abi(digest = "fFcqrZWZX4WcorTUxfMCVWeh2QcwamXKdLTzsDj58Kn")
 )]
 #[derive(Debug, Deserialize, Serialize)]
 pub enum RepairProtocol {
@@ -430,6 +431,7 @@ impl ServeRepair {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn my_id(&self) -> Pubkey {
         self.cluster_info.id()
     }
@@ -664,7 +666,7 @@ impl ServeRepair {
         let socket_addr_space = *self.cluster_info.socket_addr_space();
         let root_bank = self.sharable_banks.root();
         let epoch_staked_nodes = root_bank.epoch_staked_nodes(root_bank.epoch());
-        let identity_keypair = self.cluster_info.keypair().clone();
+        let identity_keypair = self.cluster_info.keypair();
         let my_id = identity_keypair.pubkey();
 
         let max_buffered_packets = if !self.repair_whitelist.read().unwrap().is_empty() {
@@ -995,7 +997,7 @@ impl ServeRepair {
         stats: &mut ServeRepairStats,
         data_budget: &DataBudget,
     ) {
-        let identity_keypair = self.cluster_info.keypair().clone();
+        let identity_keypair = self.cluster_info.keypair();
         let mut pending_pings = Vec::default();
 
         for RepairRequestWithMeta {
@@ -1064,7 +1066,7 @@ impl ServeRepair {
     ) -> Result<Vec<u8>> {
         let header = RepairRequestHeader {
             signature: Signature::default(),
-            sender: self.my_id(),
+            sender: keypair.pubkey(),
             recipient: *repair_peer_id,
             timestamp: timestamp(),
             nonce,
@@ -1096,7 +1098,8 @@ impl ServeRepair {
             Some(entry) if entry.asof.elapsed() < REPAIR_PEERS_CACHE_TTL => entry,
             _ => {
                 peers_cache.pop(&slot);
-                let repair_peers = self.repair_peers(repair_validators, slot);
+                let repair_peers =
+                    self.repair_peers(repair_validators, slot, &identity_keypair.pubkey());
                 let weights = cluster_slots.compute_weights(slot, &repair_peers);
                 let repair_peers = RepairPeers::new(Instant::now(), &repair_peers, &weights)?;
                 peers_cache.put(slot, repair_peers);
@@ -1135,8 +1138,9 @@ impl ServeRepair {
         cluster_slots: &ClusterSlots,
         repair_validators: &Option<HashSet<Pubkey>>,
         repair_protocol: Protocol,
+        my_pubkey: &Pubkey,
     ) -> Result<Vec<(Pubkey, SocketAddr)>> {
-        let repair_peers: Vec<_> = self.repair_peers(repair_validators, slot);
+        let repair_peers: Vec<_> = self.repair_peers(repair_validators, slot, my_pubkey);
         if repair_peers.is_empty() {
             return Err(ClusterInfoError::NoPeers.into());
         }
@@ -1159,8 +1163,9 @@ impl ServeRepair {
         slot: Slot,
         cluster_slots: &ClusterSlots,
         repair_validators: &Option<HashSet<Pubkey>>,
+        my_pubkey: &Pubkey,
     ) -> Option<(Pubkey, SocketAddr)> {
-        let repair_peers: Vec<_> = self.repair_peers(repair_validators, slot);
+        let repair_peers: Vec<_> = self.repair_peers(repair_validators, slot, my_pubkey);
         if repair_peers.is_empty() {
             return None;
         }
@@ -1185,7 +1190,7 @@ impl ServeRepair {
     ) -> Result<Vec<u8>> {
         let header = RepairRequestHeader {
             signature: Signature::default(),
-            sender: self.my_id(),
+            sender: identity_keypair.pubkey(),
             recipient: *repair_peer_id,
             timestamp: timestamp(),
             nonce,
@@ -1283,12 +1288,13 @@ impl ServeRepair {
         &self,
         repair_validators: &Option<HashSet<Pubkey>>,
         slot: Slot,
+        my_pubkey: &Pubkey,
     ) -> Vec<ContactInfo> {
         if let Some(repair_validators) = repair_validators {
             repair_validators
                 .iter()
                 .filter_map(|key| {
-                    if *key != self.my_id() {
+                    if key != my_pubkey {
                         self.cluster_info.lookup_contact_info(key, |ci| ci.clone())
                     } else {
                         None
@@ -1487,7 +1493,7 @@ mod tests {
             bank_forks,
             Arc::new(RwLock::new(HashSet::default())),
         );
-        let keypair = cluster_info.keypair().clone();
+        let keypair = cluster_info.keypair();
         let repair_peer_id = solana_pubkey::new_rand();
         let repair_request = ShredRepairType::Orphan(123);
 
@@ -1526,7 +1532,7 @@ mod tests {
         let cluster_info = Arc::new(new_test_cluster_info());
         let repair_peer_id = solana_pubkey::new_rand();
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
-        let keypair = cluster_info.keypair().clone();
+        let keypair = cluster_info.keypair();
 
         let mut bank = Bank::new_for_tests(&genesis_config);
         bank.feature_set = Arc::new(FeatureSet::all_enabled());
@@ -1573,7 +1579,7 @@ mod tests {
             bank_forks,
             Arc::new(RwLock::new(HashSet::default())),
         );
-        let keypair = cluster_info.keypair().clone();
+        let keypair = cluster_info.keypair();
         let repair_peer_id = solana_pubkey::new_rand();
 
         let slot = 50;
@@ -1771,7 +1777,7 @@ mod tests {
     /// test run_window_request responds with the right shred, and do not overrun
     pub fn run_highest_window_request(slot: Slot, num_slots: u64, nonce: Nonce) {
         let recycler = PacketBatchRecycler::default();
-        solana_logger::setup();
+        agave_logger::setup();
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
         let handler = StandardRepairHandler::new(blockstore.clone());
@@ -1824,7 +1830,7 @@ mod tests {
         let slot = 2;
         let nonce = 9;
         let recycler = PacketBatchRecycler::default();
-        solana_logger::setup();
+        agave_logger::setup();
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
         let handler = StandardRepairHandler::new(blockstore.clone());
@@ -1838,7 +1844,7 @@ mod tests {
             &keypair,
             &[],
             true,
-            Some(Hash::default()),
+            Hash::default(),
             index as u32,
             index as u32,
             &reed_solomon_cache,
@@ -1881,14 +1887,14 @@ mod tests {
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
         let bank = Bank::new_for_tests(&genesis_config);
         let bank_forks = BankForks::new_rw_arc(bank);
-        let cluster_slots = ClusterSlots::default();
+        let cluster_slots = ClusterSlots::default_for_tests();
         let cluster_info = Arc::new(new_test_cluster_info());
         let serve_repair = ServeRepair::new_for_test(
             cluster_info.clone(),
             bank_forks,
             Arc::new(RwLock::new(HashSet::default())),
         );
-        let identity_keypair = cluster_info.keypair().clone();
+        let identity_keypair = cluster_info.keypair();
         let mut outstanding_requests = OutstandingShredRepairs::default();
         let (repair_request_quic_sender, _) = tokio::sync::mpsc::channel(/*buffer:*/ 128);
         let rv = serve_repair.repair_request(
@@ -1991,7 +1997,7 @@ mod tests {
     }
 
     pub fn run_orphan(slot: Slot, num_slots: u64, nonce: Nonce) {
-        solana_logger::setup();
+        agave_logger::setup();
         let recycler = PacketBatchRecycler::default();
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
@@ -2045,7 +2051,7 @@ mod tests {
 
     #[test]
     fn run_orphan_corrupted_shred_size() {
-        solana_logger::setup();
+        agave_logger::setup();
         let recycler = PacketBatchRecycler::default();
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
@@ -2101,7 +2107,7 @@ mod tests {
                 .unwrap()
         }
 
-        solana_logger::setup();
+        agave_logger::setup();
         let recycler = PacketBatchRecycler::default();
         let ledger_path = get_tmp_ledger_path_auto_delete!();
 
@@ -2182,7 +2188,7 @@ mod tests {
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
         let bank = Bank::new_for_tests(&genesis_config);
         let bank_forks = BankForks::new_rw_arc(bank);
-        let cluster_slots = ClusterSlots::default();
+        let cluster_slots = ClusterSlots::default_for_tests();
         let cluster_info = Arc::new(new_test_cluster_info());
         let me = cluster_info.my_contact_info();
         let (repair_request_quic_sender, _) = tokio::sync::mpsc::channel(/*buffer:*/ 128);
@@ -2191,7 +2197,7 @@ mod tests {
         let contact_info3 = ContactInfo::new_localhost(&solana_pubkey::new_rand(), timestamp());
         cluster_info.insert_info(contact_info2.clone());
         cluster_info.insert_info(contact_info3.clone());
-        let identity_keypair = cluster_info.keypair().clone();
+        let identity_keypair = cluster_info.keypair();
         let serve_repair = ServeRepair::new_for_test(
             cluster_info,
             bank_forks,
@@ -2204,7 +2210,9 @@ mod tests {
         // then no repairs should be generated
         for pubkey in &[solana_pubkey::new_rand(), *me.pubkey()] {
             let known_validators = Some(vec![*pubkey].into_iter().collect());
-            assert!(serve_repair.repair_peers(&known_validators, 1).is_empty());
+            assert!(serve_repair
+                .repair_peers(&known_validators, 1, &identity_keypair.pubkey())
+                .is_empty());
             assert_matches!(
                 serve_repair.repair_request(
                     &cluster_slots,
@@ -2223,7 +2231,8 @@ mod tests {
 
         // If known validator exists in gossip, should return repair successfully
         let known_validators = Some(vec![*contact_info2.pubkey()].into_iter().collect());
-        let repair_peers = serve_repair.repair_peers(&known_validators, 1);
+        let repair_peers =
+            serve_repair.repair_peers(&known_validators, 1, &identity_keypair.pubkey());
         assert_eq!(repair_peers.len(), 1);
         assert_eq!(repair_peers[0].pubkey(), contact_info2.pubkey());
         assert_matches!(
@@ -2244,7 +2253,7 @@ mod tests {
         // Using no known validators should default to all
         // validator's available in gossip, excluding myself
         let repair_peers: HashSet<Pubkey> = serve_repair
-            .repair_peers(&None, 1)
+            .repair_peers(&None, 1, &identity_keypair.pubkey())
             .into_iter()
             .map(|node| *node.pubkey())
             .collect();
@@ -2277,7 +2286,7 @@ mod tests {
                 &keypair,
                 &[],
                 true,
-                Some(Hash::default()),
+                Hash::default(),
                 0,
                 0,
                 &reed_solomon_cache,

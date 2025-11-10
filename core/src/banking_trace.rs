@@ -4,6 +4,7 @@ use {
     chrono::{DateTime, Local},
     crossbeam_channel::{unbounded, Receiver, SendError, Sender, TryRecvError},
     rolling_file::{RollingCondition, RollingConditionBasic, RollingFileAppender},
+    serde::{Deserialize, Serialize},
     solana_clock::Slot,
     solana_hash::Hash,
     std::{
@@ -63,7 +64,7 @@ pub struct BankingTracer {
 #[cfg_attr(
     feature = "frozen-abi",
     derive(AbiExample),
-    frozen_abi(digest = "91baCBT3aY2nXSAuzY3S5dnMhWabVsHowgWqYPLjfyg7")
+    frozen_abi(digest = "9njKW2EBmvkBGCHPysxFxZzg1cXgmTxAUYZZiiqFhVHr")
 )]
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TimedTracedEvent(pub std::time::SystemTime, pub TracedEvent);

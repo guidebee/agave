@@ -1,6 +1,6 @@
 #![allow(clippy::implicit_hasher)]
 use {
-    crate::shred::{self, SignedData, SIZE_OF_MERKLE_ROOT},
+    crate::shred::{self, SIZE_OF_MERKLE_ROOT},
     itertools::{izip, Itertools},
     rayon::{prelude::*, ThreadPool},
     solana_clock::Slot,
@@ -9,7 +9,7 @@ use {
     solana_nohash_hasher::BuildNoHashHasher,
     solana_perf::{
         cuda_runtime::PinnedVec,
-        packet::{Packet, PacketBatch, PacketRef},
+        packet::{BytesPacketBatch, Packet, PacketBatch, PacketRef},
         perf_libs,
         recycler_cache::RecyclerCache,
         sigverify::{self, count_packets_in_batches, TxOffset},
@@ -67,18 +67,15 @@ pub fn verify_shred_cpu(
     let Some(data) = shred::layout::get_signed_data(shred) else {
         return false;
     };
-    match data {
-        SignedData::MerkleRoot(root) => {
-            let key = (signature, *pubkey, root);
-            if cache.read().unwrap().get(&key).is_some() {
-                true
-            } else if key.0.verify(key.1.as_ref(), key.2.as_ref()) {
-                cache.write().unwrap().put(key, ());
-                true
-            } else {
-                false
-            }
-        }
+
+    let key = (signature, *pubkey, data);
+    if cache.read().unwrap().get(&key).is_some() {
+        true
+    } else if key.0.verify(key.1.as_ref(), key.2.as_ref()) {
+        cache.write().unwrap().put(key, ());
+        true
+    } else {
+        false
     }
 }
 
@@ -311,6 +308,12 @@ pub fn verify_shreds_gpu(
         .map(|batch| match batch {
             PacketBatch::Pinned(batch) => Cow::Borrowed(batch),
             PacketBatch::Bytes(batch) => Cow::Owned(batch.to_pinned_packet_batch()),
+            PacketBatch::Single(packet) => {
+                // this is ugly, but unused (gpu code) and will be removed shortly in follow up PR
+                let mut batch = BytesPacketBatch::with_capacity(1);
+                batch.push(packet.clone());
+                Cow::Owned(batch.to_pinned_packet_batch())
+            }
         })
         .collect::<Vec<_>>();
     elems.extend(pinned_batches.iter().map(|batch| perf_libs::Elems {
@@ -463,6 +466,12 @@ fn sign_shreds_gpu(
         .map(|batch| match batch {
             PacketBatch::Pinned(batch) => Cow::Borrowed(batch),
             PacketBatch::Bytes(batch) => Cow::Owned(batch.to_pinned_packet_batch()),
+            PacketBatch::Single(packet) => {
+                // this is ugly, but unused (gpu code) and will be removed shortly in follow up PR
+                let mut batch = BytesPacketBatch::with_capacity(1);
+                batch.push(packet.clone());
+                Cow::Owned(batch.to_pinned_packet_batch())
+            }
         })
         .collect::<Vec<_>>();
     elems.extend(pinned_batches.iter().map(|batch| perf_libs::Elems {
@@ -545,11 +554,11 @@ mod tests {
         solana_system_transaction as system_transaction,
         solana_transaction::Transaction,
         std::iter::{once, repeat_with},
-        test_case::test_matrix,
+        test_case::test_case,
     };
 
     fn run_test_sigverify_shred_cpu(slot: Slot) {
-        solana_logger::setup();
+        agave_logger::setup();
         let mut packet = Packet::default();
         let cache = RwLock::new(LruCache::new(/*capacity:*/ 128));
         let shredder = Shredder::new(slot, slot.saturating_sub(1), 0, 0).unwrap();
@@ -559,7 +568,7 @@ mod tests {
             &keypair,
             &[],
             true,
-            Some(Hash::default()),
+            Hash::default(),
             0,
             0,
             &reed_solomon_cache,
@@ -588,7 +597,7 @@ mod tests {
     }
 
     fn run_test_sigverify_shreds_cpu(thread_pool: &ThreadPool, slot: Slot) {
-        solana_logger::setup();
+        agave_logger::setup();
         let cache = RwLock::new(LruCache::new(/*capacity:*/ 128));
         let keypair = Keypair::new();
         let batch = make_packet_batch(&keypair, slot);
@@ -622,7 +631,7 @@ mod tests {
     }
 
     fn run_test_sigverify_shreds_gpu(thread_pool: &ThreadPool, slot: Slot) {
-        solana_logger::setup();
+        agave_logger::setup();
         let recycler_cache = RecyclerCache::default();
         let cache = RwLock::new(LruCache::new(/*capacity:*/ 128));
 
@@ -692,7 +701,7 @@ mod tests {
             keypair,
             &[],
             true,
-            Some(Hash::default()),
+            Hash::default(),
             0,
             0,
             &reed_solomon_cache,
@@ -743,7 +752,6 @@ mod tests {
 
     fn make_shreds<R: Rng>(
         rng: &mut R,
-        chained: bool,
         is_last_in_slot: bool,
         keypairs: &HashMap<Slot, Keypair>,
     ) -> Vec<Shred> {
@@ -764,10 +772,9 @@ mod tests {
                     keypair,
                     &make_entries(rng, num_entries),
                     is_last_in_slot,
-                    // chained_merkle_root
-                    chained.then(|| Hash::new_from_array(rng.gen())),
-                    rng.gen_range(0..2671), // next_shred_index
-                    rng.gen_range(0..2781), // next_code_index
+                    Hash::new_from_array(rng.gen()), // chained_merkle_root
+                    rng.gen_range(0..2671),          // next_shred_index
+                    rng.gen_range(0..2781),          // next_code_index
                     &reed_solomon_cache,
                     &mut ProcessShredsStats::default(),
                 )
@@ -814,11 +821,9 @@ mod tests {
         packets
     }
 
-    #[test_matrix(
-        [true, false],
-        [true, false]
-    )]
-    fn test_verify_shreds_fuzz(chained: bool, is_last_in_slot: bool) {
+    #[test_case(true)]
+    #[test_case(false)]
+    fn test_verify_shreds_fuzz(is_last_in_slot: bool) {
         let mut rng = rand::thread_rng();
         let cache = RwLock::new(LruCache::new(/*capacity:*/ 128));
         let thread_pool = ThreadPoolBuilder::new().num_threads(3).build().unwrap();
@@ -827,7 +832,7 @@ mod tests {
             .map(|slot| (slot, Keypair::new()))
             .take(3)
             .collect();
-        let shreds = make_shreds(&mut rng, chained, is_last_in_slot, &keypairs);
+        let shreds = make_shreds(&mut rng, is_last_in_slot, &keypairs);
         let pubkeys: SlotPubkeys = keypairs
             .iter()
             .map(|(&slot, keypair)| (slot, keypair.pubkey()))
@@ -866,11 +871,9 @@ mod tests {
         );
     }
 
-    #[test_matrix(
-        [true, false],
-        [true, false]
-    )]
-    fn test_sign_shreds_gpu(chained: bool, is_last_in_slot: bool) {
+    #[test_case(true)]
+    #[test_case(false)]
+    fn test_sign_shreds_gpu(is_last_in_slot: bool) {
         let mut rng = rand::thread_rng();
         let cache = RwLock::new(LruCache::new(/*capacity:*/ 128));
         let thread_pool = ThreadPoolBuilder::new().num_threads(3).build().unwrap();
@@ -880,7 +883,7 @@ mod tests {
                 .map(|slot| (slot, Keypair::new()))
                 .take(3)
                 .collect();
-            make_shreds(&mut rng, chained, is_last_in_slot, &keypairs)
+            make_shreds(&mut rng, is_last_in_slot, &keypairs)
         };
         let keypair = Keypair::new();
         let pubkeys: SlotPubkeys = {

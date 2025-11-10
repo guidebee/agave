@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 #![forbid(unsafe_code)]
 // Allow deprecated warnings since this crate will be removed along with
 // `solana-zk-token-sdk` will be removed
@@ -143,7 +152,7 @@ fn process_close_proof_context(invoke_context: &mut InvokeContext) -> Result<(),
             return Err(InstructionError::MissingRequiredSignature);
         }
 
-        *instruction_context.get_program_key()?
+        *instruction_context.get_key_of_instruction_account(2)?
     };
 
     let proof_context_account_pubkey = *instruction_context.get_key_of_instruction_account(0)?;

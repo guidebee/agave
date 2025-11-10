@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 #![allow(clippy::arithmetic_side_effects)]
 
 pub mod nonblocking;
@@ -63,10 +72,17 @@ pub struct UdpConfig {
 
 impl NewConnectionConfig for UdpConfig {
     fn new() -> Result<Self, ClientError> {
+        // Use UNSPECIFIED for production validators to bind to all interfaces
+        // Use LOCALHOST only in dev/test context to avoid port conflicts in CI
+        #[cfg(not(feature = "dev-context-only-utils"))]
+        let bind_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+        #[cfg(feature = "dev-context-only-utils")]
+        let bind_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
         // This will bind to random ports, but VALIDATOR_PORT_RANGE is outside
         // of the range for CI tests when this is running in CI
         let socket = sockets::bind_in_range_with_config(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            bind_ip,
             solana_net_utils::VALIDATOR_PORT_RANGE,
             SocketConfiguration::default(),
         )

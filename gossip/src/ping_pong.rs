@@ -2,6 +2,7 @@ use {
     crate::cluster_info_metrics::should_report_message_signature,
     lru::LruCache,
     rand::{CryptoRng, Rng},
+    serde::{Deserialize, Serialize},
     serde_big_array::BigArray,
     siphasher::sip::SipHasher24,
     solana_hash::Hash,
@@ -93,7 +94,7 @@ impl<const N: usize> Signable for Ping<N> {
     }
 
     #[inline]
-    fn signable_data(&self) -> Cow<[u8]> {
+    fn signable_data(&self) -> Cow<'_, [u8]> {
         Cow::Borrowed(&self.token)
     }
 
@@ -139,7 +140,7 @@ impl Signable for Pong {
         self.from
     }
 
-    fn signable_data(&self) -> Cow<[u8]> {
+    fn signable_data(&self) -> Cow<'static, [u8]> {
         Cow::Owned(self.hash.as_ref().into())
     }
 

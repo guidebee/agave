@@ -29,7 +29,7 @@ usage() {
     echo "Error: $*"
   fi
   cat <<EOF
-usage: $0 [+<cargo version>] [--debug] [--validator-only] [--release-with-debug] <install directory>
+usage: $0 [+<cargo version>] [--debug] [--validator-only] [--release-with-debug] [--no-spl-token] <install directory>
 EOF
   exit $exitcode
 }
@@ -42,7 +42,7 @@ installDir=
 buildProfileArg='--profile release'
 buildProfile='release'
 validatorOnly=
-publicRelease=
+noSPLToken=
 
 while [[ -n $1 ]]; do
   if [[ ${1:0:1} = - ]]; then
@@ -61,8 +61,8 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --validator-only ]]; then
       validatorOnly=true
       shift
-    elif [[ $1 = --public-release ]]; then
-      publicRelease=true
+    elif [[ $1 = --no-spl-token ]]; then
+      noSPLToken=true
       shift
     else
       usage "Unknown option: $1"
@@ -90,58 +90,24 @@ cd "$(dirname "$0")"/..
 
 SECONDS=0
 
-if [[ $CI_OS_NAME = windows ]]; then
-  # Limit windows to end-user command-line tools.  Full validator support is not
-  # yet available on windows
-  BINS=(
-    cargo-build-sbf
-    cargo-test-sbf
-    solana
-    agave-install
-    agave-install-init
-    solana-keygen
-    solana-test-validator
-    solana-tokens
-  )
-  DCOU_BINS=()
+source "$SOLANA_ROOT"/scripts/agave-build-lists.sh
+
+BINS=()
+DCOU_BINS=()
+if [[ -n "$validatorOnly" ]]; then
+  echo "Building binaries for net.sh deploys: ${AGAVE_BINS_END_USER[*]} ${AGAVE_BINS_VAL_OP[*]} ${AGAVE_BINS_DCOU[*]}"
+  BINS+=("${AGAVE_BINS_END_USER[@]}" "${AGAVE_BINS_VAL_OP[@]}")
+  DCOU_BINS+=("${AGAVE_BINS_DCOU[@]}")
 else
-  ./fetch-perf-libs.sh
+  echo "Building binaries for all platforms: ${AGAVE_BINS_DEV[*]} ${AGAVE_BINS_END_USER[*]} ${AGAVE_BINS_DEPRECATED[*]}"
+  BINS+=("${AGAVE_BINS_DEV[@]}" "${AGAVE_BINS_END_USER[@]}" "${AGAVE_BINS_DEPRECATED[@]}")
 
-  DCOU_BINS=()
-  BINS=(
-    solana
-    solana-faucet
-    solana-genesis
-    agave-install
-    solana-keygen
-  )
-
-  if [[ -z "$publicRelease" ]]; then
-    BINS+=(
-      agave-validator
-      agave-watchtower
-      solana-gossip
-    )
-
-    DCOU_BINS+=(
-      agave-ledger-tool
-    )
-  fi
-
-
-  # Speed up net.sh deploys by excluding unused binaries
-  if [[ -z "$validatorOnly" ]]; then
-    BINS+=(
-      cargo-build-sbf
-      cargo-test-sbf
-      agave-install-init
-      solana-stake-accounts
-      solana-test-validator
-    )
+  if [[ $OSTYPE != msys ]]; then
+    echo "Building binaries for linux and osx only: ${AGAVE_BINS_VAL_OP[*]}, ${AGAVE_BINS_DCOU[*]}"
+    BINS+=("${AGAVE_BINS_VAL_OP[@]}")
+    DCOU_BINS+=("${AGAVE_BINS_DCOU[@]}")
   fi
 fi
-
-echo "Building binaries for: ${BINS[*]}"
 
 binArgs=()
 for bin in "${BINS[@]}"; do
@@ -152,15 +118,6 @@ dcouBinArgs=()
 for bin in "${DCOU_BINS[@]}"; do
   dcouBinArgs+=(--bin "$bin")
 done
-
-source "$SOLANA_ROOT"/scripts/dcou-tainted-packages.sh
-
-excludeArgs=()
-for package in "${dcou_tainted_packages[@]}"; do
-  excludeArgs+=(--exclude "$package")
-done
-
-mkdir -p "$installDir/bin"
 
 cargo_build() {
   # shellcheck disable=SC2086 # Don't want to double quote $maybeRustVersion
@@ -188,25 +145,25 @@ check_dcou() {
   # output after turning rustc into the nightly mode with RUSTC_BOOTSTRAP=1.
   # In this way, additional requirement of nightly rustc toolchian is avoided.
   # Note that `cargo tree` can't be used, because it doesn't support `--bin`.
-  if check_dcou "${binArgs[@]}" --workspace "${excludeArgs[@]}"; then
+  if check_dcou "${binArgs[@]}" --workspace; then
      echo 'dcou feature activation is incorrectly activated!'
      exit 1
   fi
 
   # Build our production binaries without dcou.
-  cargo_build "${binArgs[@]}" --workspace "${excludeArgs[@]}"
+  cargo_build "${binArgs[@]}" --workspace
 
   # Finally, build the remaining dev tools with dcou.
   if [[ ${#dcouBinArgs[@]} -gt 0 ]]; then
-    if ! check_dcou "${dcouBinArgs[@]}"; then
+    if ! check_dcou --manifest-path "dev-bins/Cargo.toml" "${dcouBinArgs[@]}"; then
        echo 'dcou feature activation is incorrectly remain to be deactivated!'
        exit 1
     fi
-    cargo_build "${dcouBinArgs[@]}"
+    cargo_build --manifest-path "dev-bins/Cargo.toml" "${dcouBinArgs[@]}"
   fi
 
-  # Exclude `spl-token` binary for net.sh builds
-  if [[ -z "$validatorOnly" ]]; then
+  # Exclude `spl-token` if requested
+  if [[ -z "$noSPLToken" ]]; then
     # shellcheck source=scripts/spl-token-cli-version.sh
     source "$SOLANA_ROOT"/scripts/spl-token-cli-version.sh
 
@@ -215,12 +172,20 @@ check_dcou() {
   fi
 )
 
-for bin in "${BINS[@]}" "${DCOU_BINS[@]}"; do
+for bin in "${BINS[@]}"; do
   cp -fv "target/$buildProfile/$bin" "$installDir"/bin
 done
 
-if [[ -d target/perf-libs ]]; then
-  cp -a target/perf-libs "$installDir"/bin/perf-libs
+for bin in "${DCOU_BINS[@]}"; do
+  cp -fv "dev-bins/target/$buildProfile/$bin" "$installDir"/bin
+done
+
+if [[ $OSTYPE != msys ]]; then
+  ./fetch-perf-libs.sh
+
+  if [[ -d target/perf-libs ]]; then
+    cp -a target/perf-libs "$installDir"/bin/perf-libs
+  fi
 fi
 
 if [[ -z "$validatorOnly" ]]; then
@@ -237,7 +202,7 @@ fi
   # deps dir can be empty
   shopt -s nullglob
   for dep in target/"$buildProfile"/deps/libsolana*program.*; do
-    cp -fv "$dep" "$installDir/bin/deps"
+    cp -fv "$dep" "$installDir"/bin/deps
   done
 )
 

@@ -123,7 +123,7 @@ impl BroadcastRun for BroadcastDuplicatesRun {
         let last_entries = {
             if last_tick_height == bank.max_tick_height()
                 && bank.slot() > MINIMUM_DUPLICATE_SLOT
-                && self.num_slots_broadcasted % DUPLICATE_RATE == 0
+                && self.num_slots_broadcasted.is_multiple_of(DUPLICATE_RATE)
                 && self.recent_blockhash.is_some()
             {
                 let entry_batch_len = receive_results.entries.len();
@@ -185,7 +185,7 @@ impl BroadcastRun for BroadcastDuplicatesRun {
             keypair,
             &receive_results.entries,
             last_tick_height == bank.max_tick_height() && last_entries.is_none(),
-            Some(self.chained_merkle_root),
+            self.chained_merkle_root,
             self.next_shred_index,
             self.next_code_index,
             &self.reed_solomon_cache,
@@ -204,7 +204,7 @@ impl BroadcastRun for BroadcastDuplicatesRun {
                     keypair,
                     &[original_last_entry],
                     true,
-                    Some(self.chained_merkle_root),
+                    self.chained_merkle_root,
                     self.next_shred_index,
                     self.next_code_index,
                     &self.reed_solomon_cache,
@@ -217,7 +217,7 @@ impl BroadcastRun for BroadcastDuplicatesRun {
                     keypair,
                     &duplicate_extra_last_entries,
                     true,
-                    Some(self.chained_merkle_root),
+                    self.chained_merkle_root,
                     self.next_shred_index,
                     self.next_code_index,
                     &self.reed_solomon_cache,

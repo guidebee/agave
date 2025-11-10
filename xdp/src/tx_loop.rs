@@ -118,7 +118,7 @@ pub fn tx_loop<T: AsRef<[u8]>, A: AsRef<[SocketAddr]>>(
     // How long we sleep waiting to receive shreds from the channel.
     const RECV_TIMEOUT: Duration = Duration::from_nanos(1000);
 
-    const MAX_TIMEOUTS: usize = 500;
+    const MAX_TIMEOUTS: usize = 1;
 
     // We try to collect _at least_ BATCH_SIZE packets before queueing into the NIC. This is to
     // avoid introducing too much per-packet overhead and giving the NIC time to complete work
@@ -209,7 +209,8 @@ pub fn tx_loop<T: AsRef<[u8]>, A: AsRef<[SocketAddr]>>(
                     // sanity check that the address is routable through our NIC
                     if next_hop.if_index != dev.if_index() {
                         log::warn!(
-                            "dropping packet: turbine peer {addr} must be routed through if_index: {} our if_index: {}",
+                            "dropping packet: turbine peer {addr} must be routed through \
+                             if_index: {} our if_index: {}",
                             next_hop.if_index,
                             dev.if_index()
                         );
@@ -218,7 +219,11 @@ pub fn tx_loop<T: AsRef<[u8]>, A: AsRef<[SocketAddr]>>(
 
                     // we need the MAC address to send the packet
                     if next_hop.mac_addr.is_none() {
-                        log::warn!("dropping packet: turbine peer {addr} must be routed through {} which has no known MAC address", next_hop.ip_addr);
+                        log::warn!(
+                            "dropping packet: turbine peer {addr} must be routed through {} which \
+                             has no known MAC address",
+                            next_hop.ip_addr
+                        );
                         skip = true;
                     };
 

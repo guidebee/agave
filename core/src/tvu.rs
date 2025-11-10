@@ -5,8 +5,8 @@ use {
     crate::{
         banking_trace::BankingTracer,
         cluster_info_vote_listener::{
-            DuplicateConfirmedSlotsReceiver, GossipVerifiedVoteHashReceiver, VerifiedVoteReceiver,
-            VoteTracker,
+            DuplicateConfirmedSlotsReceiver, GossipVerifiedVoteHashReceiver,
+            VerifiedVoterSlotsReceiver, VoteTracker,
         },
         cluster_slots_service::{cluster_slots::ClusterSlots, ClusterSlotsService},
         completed_data_sets_service::CompletedDataSetsSender,
@@ -35,7 +35,7 @@ use {
         blockstore_processor::TransactionStatusSender, entry_notifier_service::EntryNotifierSender,
         leader_schedule_cache::LeaderScheduleCache,
     },
-    solana_poh::poh_recorder::PohRecorder,
+    solana_poh::{poh_controller::PohController, poh_recorder::PohRecorder},
     solana_pubkey::Pubkey,
     solana_rpc::{
         max_slots::MaxSlots, optimistically_confirmed_bank_tracker::BankNotificationSenderConfig,
@@ -137,6 +137,7 @@ impl Tvu {
         ledger_signal_receiver: Receiver<bool>,
         rpc_subscriptions: Option<Arc<RpcSubscriptions>>,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
+        poh_controller: PohController,
         tower: Tower,
         tower_storage: Arc<dyn TowerStorage>,
         leader_schedule_cache: &Arc<LeaderScheduleCache>,
@@ -148,7 +149,7 @@ impl Tvu {
         vote_tracker: Arc<VoteTracker>,
         retransmit_slots_sender: Sender<Slot>,
         gossip_verified_vote_hash_receiver: GossipVerifiedVoteHashReceiver,
-        verified_vote_receiver: VerifiedVoteReceiver,
+        verified_voter_slots_receiver: VerifiedVoterSlotsReceiver,
         replay_vote_sender: ReplayVoteSender,
         completed_data_sets_sender: Option<CompletedDataSetsSender>,
         bank_notification_sender: Option<BankNotificationSenderConfig>,
@@ -229,6 +230,8 @@ impl Tvu {
             rpc_subscriptions.clone(),
             slot_status_notifier.clone(),
             tvu_config.xdp_sender,
+            // votor_event_sender is Alpenglow specific sender, it is None if Alpenglow is not enabled.
+            None,
         );
 
         let (ancestor_duplicate_slots_sender, ancestor_duplicate_slots_receiver) = unbounded();
@@ -256,7 +259,7 @@ impl Tvu {
             };
             let repair_service_channels = RepairServiceChannels::new(
                 repair_request_quic_sender,
-                verified_vote_receiver,
+                verified_voter_slots_receiver,
                 dumped_slots_receiver,
                 popular_pruned_forks_sender,
                 ancestor_hashes_request_quic_sender,
@@ -337,6 +340,7 @@ impl Tvu {
             bank_forks: bank_forks.clone(),
             cluster_info: cluster_info.clone(),
             poh_recorder: poh_recorder.clone(),
+            poh_controller,
             tower,
             vote_tracker,
             cluster_slots,
@@ -481,7 +485,7 @@ pub mod tests {
     };
 
     fn test_tvu_exit(enable_wen_restart: bool) {
-        solana_logger::setup();
+        agave_logger::setup();
         let leader = Node::new_localhost();
         let target1_keypair = Keypair::new();
         let target1 = Node::new_localhost_with_pubkey(&target1_keypair.pubkey());
@@ -515,8 +519,14 @@ pub mod tests {
             .expect("Expected to successfully open ledger");
         let blockstore = Arc::new(blockstore);
         let bank = bank_forks.read().unwrap().working_bank();
-        let (exit, poh_recorder, _transaction_recorder, poh_service, _entry_receiver) =
-            create_test_recorder(bank.clone(), blockstore.clone(), None, None);
+        let (
+            exit,
+            poh_recorder,
+            poh_controller,
+            _transaction_recorder,
+            poh_service,
+            _entry_receiver,
+        ) = create_test_recorder(bank.clone(), blockstore.clone(), None, None);
         let vote_keypair = Keypair::new();
         let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
         let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::default()));
@@ -528,14 +538,14 @@ pub mod tests {
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
         let ignored_prioritization_fee_cache = Arc::new(PrioritizationFeeCache::new(0u64));
         let outstanding_repair_requests = Arc::<RwLock<OutstandingShredRepairs>>::default();
-        let cluster_slots = Arc::new(ClusterSlots::default());
+        let cluster_slots = Arc::new(ClusterSlots::default_for_tests());
         let wen_restart_repair_slots = if enable_wen_restart {
             Some(Arc::new(RwLock::new(vec![])))
         } else {
             None
         };
         let connection_cache = if DEFAULT_VOTE_USE_QUIC {
-            ConnectionCache::new_quic(
+            ConnectionCache::new_quic_for_tests(
                 "connection_cache_vote_quic",
                 DEFAULT_TPU_CONNECTION_POOL_SIZE,
             )
@@ -570,6 +580,7 @@ pub mod tests {
                 OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks),
             ))),
             &poh_recorder,
+            poh_controller,
             Tower::default(),
             Arc::new(FileTowerStorage::default()),
             &leader_schedule_cache,

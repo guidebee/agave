@@ -92,7 +92,7 @@ impl StandardBroadcastRun {
                     keypair,
                     &[],  // entries
                     true, // is_last_in_slot,
-                    Some(self.chained_merkle_root),
+                    self.chained_merkle_root,
                     self.next_shred_index,
                     self.next_code_index,
                     &self.reed_solomon_cache,
@@ -126,7 +126,7 @@ impl StandardBroadcastRun {
                     keypair,
                     entries,
                     is_slot_end,
-                    Some(self.chained_merkle_root),
+                    self.chained_merkle_root,
                     self.next_shred_index,
                     self.next_code_index,
                     &self.reed_solomon_cache,
@@ -384,7 +384,10 @@ impl StandardBroadcastRun {
         quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
     ) -> Result<()> {
         trace!("Broadcasting {:?} shreds", shreds.len());
-        let mut transmit_stats = TransmitShredsStats::default();
+        let mut transmit_stats = TransmitShredsStats {
+            is_xdp: matches!(sock, BroadcastSocket::Xdp(_)),
+            ..Default::default()
+        };
         // Broadcast the shreds
         let mut transmit_time = Measure::start("broadcast_shreds");
 
@@ -814,7 +817,7 @@ mod test {
 
     #[test]
     fn entries_to_shreds_max() {
-        solana_logger::setup();
+        agave_logger::setup();
         let keypair = Keypair::new();
         let mut bs = StandardBroadcastRun::new(0);
         bs.slot = 1;

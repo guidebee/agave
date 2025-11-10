@@ -1,16 +1,31 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 //! The solana-program-test provides a BanksClient-based test framework SBF programs
 #![allow(clippy::arithmetic_side_effects)]
 
 // Export tokio for test clients
 pub use tokio;
 use {
-    agave_feature_set::{raise_cpi_nesting_limit_to_8, FEATURE_NAMES},
+    agave_feature_set::{
+        increase_cpi_account_info_limit, raise_cpi_nesting_limit_to_8, FEATURE_NAMES,
+    },
     async_trait::async_trait,
     base64::{prelude::BASE64_STANDARD, Engine},
     chrono_humanize::{Accuracy, HumanTime, Tense},
     log::*,
-    solana_account::{create_account_shared_data_for_test, Account, AccountSharedData},
+    solana_account::{
+        create_account_shared_data_for_test, state_traits::StateMut, Account, AccountSharedData,
+        ReadableAccount,
+    },
     solana_account_info::AccountInfo,
+    solana_accounts_db::accounts_db::ACCOUNTS_DB_CONFIG_FOR_TESTING,
     solana_banks_client::start_client,
     solana_banks_server::banks_server::start_local_server,
     solana_clock::{Epoch, Slot},
@@ -47,7 +62,7 @@ use {
     solana_svm_timings::ExecuteTimings,
     solana_sysvar::SysvarSerialize,
     solana_sysvar_id::SysvarId,
-    solana_vote_program::vote_state::{self, VoteStateV3, VoteStateVersions},
+    solana_vote_program::vote_state::{VoteStateV4, VoteStateVersions},
     std::{
         cell::RefCell,
         collections::{HashMap, HashSet},
@@ -57,6 +72,7 @@ use {
         mem::transmute,
         panic::AssertUnwindSafe,
         path::{Path, PathBuf},
+        ptr,
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc, RwLock,
@@ -94,12 +110,12 @@ fn set_invoke_context(new: &mut InvokeContext) {
         invoke_context.replace(Some(transmute::<&mut InvokeContext, usize>(new)))
     });
 }
-fn get_invoke_context<'a, 'b>() -> &'a mut InvokeContext<'b> {
+fn get_invoke_context<'a, 'b>() -> &'a mut InvokeContext<'b, 'b> {
     let ptr = INVOKE_CONTEXT.with(|invoke_context| match *invoke_context.borrow() {
         Some(val) => val,
         None => panic!("Invoke context not set!"),
     });
-    unsafe { transmute::<usize, &mut InvokeContext>(ptr) }
+    unsafe { &mut *ptr::with_exposed_provenance_mut(ptr) }
 }
 
 pub fn invoke_builtin_function(
@@ -130,12 +146,13 @@ pub fn invoke_builtin_function(
     let mask_out_rent_epoch_in_vm_serialization = invoke_context
         .get_feature_set()
         .mask_out_rent_epoch_in_vm_serialization;
-    let (mut parameter_bytes, _regions, _account_lengths) = serialize_parameters(
-        &instruction_context,
-        false, // There is no VM so stricter_abi_and_runtime_constraints can not be implemented here
-        false, // There is no VM so account_data_direct_mapping can not be implemented here
-        mask_out_rent_epoch_in_vm_serialization,
-    )?;
+    let (mut parameter_bytes, _regions, _account_lengths, _instruction_data_offset) =
+        serialize_parameters(
+            &instruction_context,
+            false, // There is no VM so stricter_abi_and_runtime_constraints can not be implemented here
+            false, // There is no VM so account_data_direct_mapping can not be implemented here
+            mask_out_rent_epoch_in_vm_serialization,
+        )?;
 
     // Deserialize data back into instruction params
     let (program_id, account_infos, input) =
@@ -268,7 +285,7 @@ impl solana_sysvar::program_stubs::SyscallStubs for SyscallStubs {
             .collect::<Vec<_>>();
 
         invoke_context
-            .prepare_next_instruction(instruction, &signers)
+            .prepare_next_instruction(instruction.clone(), &signers)
             .unwrap();
 
         // Copy caller's account_info modifications into invoke_context accounts
@@ -490,7 +507,7 @@ impl Default for ProgramTest {
     /// * the current working directory
     ///
     fn default() -> Self {
-        solana_logger::setup_with_default(
+        agave_logger::setup_with_default(
             "solana_sbpf::vm=debug,solana_runtime::message_processor=debug,\
              solana_runtime::system_instruction_processor=trace,solana_program_test=info",
         );
@@ -625,8 +642,9 @@ impl ProgramTest {
         program_name: &'static str,
         program_id: &Pubkey,
     ) {
-        let program_file = find_file(&format!("{program_name}.so"))
-            .expect("Program file data not available for {program_name} ({program_id})");
+        let program_file = find_file(&format!("{program_name}.so")).unwrap_or_else(|| {
+            panic!("Program file data not available for {program_name} ({program_id})")
+        });
         let elf = read_file(program_file);
         let program_accounts =
             programs::bpf_loader_upgradeable_program_accounts(program_id, &elf, &Rent::default());
@@ -792,7 +810,7 @@ impl ProgramTest {
         };
         let bootstrap_validator_pubkey = Pubkey::new_unique();
         let bootstrap_validator_stake_lamports =
-            rent.minimum_balance(VoteStateV3::size_of()) + 1_000_000 * LAMPORTS_PER_SOL;
+            rent.minimum_balance(VoteStateV4::size_of()) + 1_000_000 * LAMPORTS_PER_SOL;
 
         let mint_keypair = Keypair::new();
         let voting_keypair = Keypair::new();
@@ -803,6 +821,7 @@ impl ProgramTest {
             &bootstrap_validator_pubkey,
             &voting_keypair.pubkey(),
             &Pubkey::new_unique(),
+            None,
             bootstrap_validator_stake_lamports,
             42,
             fee_rate_governor,
@@ -834,7 +853,7 @@ impl ProgramTest {
         debug!("Payer address: {}", mint_keypair.pubkey());
         debug!("Genesis config: {genesis_config}");
 
-        let bank = Bank::new_with_paths(
+        let bank = Bank::new_from_genesis(
             &genesis_config,
             Arc::new(RuntimeConfig {
                 compute_budget: self.compute_max_units.map(|max_units| ComputeBudget {
@@ -843,6 +862,9 @@ impl ProgramTest {
                         genesis_config
                             .accounts
                             .contains_key(&raise_cpi_nesting_limit_to_8::id()),
+                        genesis_config
+                            .accounts
+                            .contains_key(&increase_cpi_account_info_limit::id()),
                     )
                 }),
                 transaction_account_lock_limit: self.transaction_account_lock_limit,
@@ -850,9 +872,7 @@ impl ProgramTest {
             }),
             Vec::default(),
             None,
-            None,
-            false,
-            None,
+            ACCOUNTS_DB_CONFIG_FOR_TESTING,
             None,
             None,
             Arc::default(),
@@ -1093,14 +1113,48 @@ impl ProgramTestContext {
 
         // generate some vote activity for rewards
         let mut vote_account = bank.get_account(vote_account_address).unwrap();
-        let mut vote_state = vote_state::from(&vote_account).unwrap();
+        let mut vote_state =
+            VoteStateV4::deserialize(vote_account.data(), vote_account_address).unwrap();
 
         let epoch = bank.epoch();
+        // Inlined from vote program - maximum number of epoch credits to keep in history
+        const MAX_EPOCH_CREDITS_HISTORY: usize = 64;
         for _ in 0..number_of_credits {
-            vote_state.increment_credits(epoch, 1);
+            // Inline increment_credits logic from vote program.
+            let credits = 1;
+
+            // never seen a credit
+            if vote_state.epoch_credits.is_empty() {
+                vote_state.epoch_credits.push((epoch, 0, 0));
+            } else if epoch != vote_state.epoch_credits.last().unwrap().0 {
+                let (_, credits_val, prev_credits) = *vote_state.epoch_credits.last().unwrap();
+
+                if credits_val != prev_credits {
+                    // if credits were earned previous epoch
+                    // append entry at end of list for the new epoch
+                    vote_state
+                        .epoch_credits
+                        .push((epoch, credits_val, credits_val));
+                } else {
+                    // else just move the current epoch
+                    vote_state.epoch_credits.last_mut().unwrap().0 = epoch;
+                }
+
+                // Remove too old epoch_credits
+                if vote_state.epoch_credits.len() > MAX_EPOCH_CREDITS_HISTORY {
+                    vote_state.epoch_credits.remove(0);
+                }
+            }
+
+            vote_state.epoch_credits.last_mut().unwrap().1 = vote_state
+                .epoch_credits
+                .last()
+                .unwrap()
+                .1
+                .saturating_add(credits);
         }
-        let versioned = VoteStateVersions::new_v3(vote_state);
-        vote_state::to(&versioned, &mut vote_account).unwrap();
+        let versioned = VoteStateVersions::new_v4(vote_state);
+        vote_account.set_state(&versioned).unwrap();
         bank.store_account(vote_account_address, &vote_account);
     }
 
@@ -1160,13 +1214,11 @@ impl ProgramTestContext {
                 .clone_without_scheduler()
         };
 
-        bank_forks
-            .set_root(
-                pre_warp_slot,
-                None, // snapshots are disabled
-                Some(pre_warp_slot),
-            )
-            .unwrap();
+        bank_forks.set_root(
+            pre_warp_slot,
+            None, // snapshots are disabled
+            Some(pre_warp_slot),
+        );
 
         // warp_bank is frozen so go forward to get unfrozen bank at warp_slot
         bank_forks.insert(Bank::new_from_parent(
@@ -1207,13 +1259,11 @@ impl ProgramTestContext {
         bank.fill_bank_with_ticks_for_tests();
         let pre_warp_slot = bank.slot();
 
-        bank_forks
-            .set_root(
-                pre_warp_slot,
-                None, // snapshot_controller
-                Some(pre_warp_slot),
-            )
-            .unwrap();
+        bank_forks.set_root(
+            pre_warp_slot,
+            None, // snapshot_controller
+            Some(pre_warp_slot),
+        );
 
         // warp_bank is frozen so go forward to get unfrozen bank at warp_slot
         let warp_slot = pre_warp_slot + 1;
